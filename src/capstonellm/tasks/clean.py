@@ -1,22 +1,96 @@
 import argparse
+import json
 import logging
+
+import boto3
 from pyspark.sql import SparkSession
+
 from capstonellm.common.catalog import llm_bucket
 from capstonellm.common.spark import ClosableSparkSession
 
 logger = logging.getLogger(__name__)
 
-def clean(spark: SparkSession, environment: str, tag: str):
-    pass
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+
+def clean(spark: SparkSession, environment: str, tag: str, user: str):
+    input_path = f"s3a://{llm_bucket}/input/{tag}"
+
+    questions = (
+        spark.read.option("multiLine", True)
+        .json(f"{input_path}/questions.json")
+        .select(F.explode("items").alias("q"))
+        .select(
+            F.col("q.question_id").alias("question_id"),
+            F.col("q.title").alias("title"),
+            F.col("q.body").alias("question"),
+            F.col("q.link").alias("link"),
+        )
+    )
+
+    answers = (
+        spark.read.option("multiLine", True)
+        .json(f"{input_path}/answers.json")
+        .select(F.explode("items").alias("a"))
+        .select(
+            F.col("a.question_id").alias("question_id"),
+            F.col("a.answer_id").alias("answer_id"),
+            F.col("a.body").alias("answer"),
+            F.col("a.is_accepted").alias("is_accepted"),
+            F.col("a.score").alias("score"),
+        )
+    )
+
+    # keep only the best answer per question: accepted first, then highest score
+    best_answer_window = Window.partitionBy("question_id").orderBy(
+        F.col("is_accepted").desc(), F.col("score").desc()
+    )
+    best_answers = (
+        answers.withColumn("rank", F.row_number().over(best_answer_window))
+        .filter(F.col("rank") == 1)
+        .select("question_id", "answer_id", "answer")
+    )
+
+    result = questions.join(best_answers, on="question_id", how="inner")
+
+    output_prefix = f"cleaned/{user}/{tag}"
+    s3 = boto3.client("s3")
+    documents = result.collect()
+    for row in documents:
+        document = row.asDict()
+        s3.put_object(
+            Bucket=llm_bucket,
+            Key=f"{output_prefix}/{document['question_id']}.json",
+            Body=json.dumps(document).encode("utf-8"),
+        )
+    print(f"wrote {len(documents)} documents to s3://{llm_bucket}/{output_prefix}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="capstone_llm")
     parser.add_argument(
-        "-e", "--env", dest="env", help="environment we are executing in", required=False, default="local"
+        "-e",
+        "--env",
+        dest="env",
+        help="environment we are executing in",
+        required=False,
+        default="local",
     )
     parser.add_argument(
-        "-t", "--tag", dest="tag", help="the tag to process",
-        default="python-polars", required=False
+        "-t",
+        "--tag",
+        dest="tag",
+        help="the tag to process",
+        default="python-polars",
+        required=False,
+    )
+    parser.add_argument(
+        "-u",
+        "--user",
+        dest="user",
+        help="the user prefix to write results under",
+        required=True,
     )
     logger.info("starting the cleaning job")
 
@@ -33,10 +107,12 @@ def main():
         for key, value in common_spark_config.items():
             builder = builder.config(key, value)
         session = builder.getOrCreate()
-        clean(session, args.env, args.tag)
+        clean(session, args.env, args.tag, args.user)
     else:
-        with ClosableSparkSession("capstone_llm", spark_config=common_spark_config) as session:
-            clean(session, args.env, args.tag)
+        with ClosableSparkSession(
+            "capstone_llm", spark_config=common_spark_config
+        ) as session:
+            clean(session, args.env, args.tag, args.user)
 
 
 if __name__ == "__main__":

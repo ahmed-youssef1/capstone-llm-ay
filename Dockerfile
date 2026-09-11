@@ -5,3 +5,6 @@ ENV PYSPARK_PYTHON python3
 WORKDIR /opt/spark/work-dir
 
 #TODO add your project code and dependencies to the image
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN pip3 install --no-cache-dir .
